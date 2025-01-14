@@ -518,75 +518,76 @@ def gather_previous_txs(db_cur, tx_dict):
             prev_txs[ptxid] = ptx_dict
 
     return prev_txs
-
-# what to do when an object message arrives
+    # what to do when an object message arrives
 async def handle_object_msg(msg_dict, queue):
-    global CHAINTIP
-    global CHAINTIP_HEIGHT
-    obj_dict = msg_dict['object']
-    objid = objects.get_objid(obj_dict)
-    print(f"Received object with id {objid}: {obj_dict}")
+        global CHAINTIP
+        global CHAINTIP_HEIGHT
+        obj_dict = msg_dict['object']
+        objid = objects.get_objid(obj_dict)
+        print(f"Received object with id {objid}: {obj_dict}")
 
-    err_str = None
-    con = sqlite3.connect(const.DB_NAME)
-    try:
-        cur = con.cursor()
-        res = cur.execute("SELECT obj FROM objects WHERE oid = ?", (objid,))
+        err_str = None
+        con = sqlite3.connect(const.DB_NAME)
+        try:
+            cur = con.cursor()
+            res = cur.execute("SELECT obj FROM objects WHERE oid = ?", (objid,))
 
-        # already have object
-        if not res.fetchone() is None:
-            # object has already been verified as it is in the DB
-            return
+            # already have object
+            if not res.fetchone() is None:
+                # object has already been verified as it is in the DB
+                return
 
-        print("Received new object '{}'".format(objid))
-        # notify validator that we received this object here
-        VALIDATOR.received_object(objid)
-        if VALIDATOR.is_pending(objid):
-            VALIDATOR.add_peer(objid, queue)
-            return # no need to rerun verification that is pending yet
+            print("Received new object '{}'".format(objid))
+            # notify validator that we received this object here
+            VALIDATOR.received_object(objid)
+            if VALIDATOR.is_pending(objid):
+                VALIDATOR.add_peer(objid, queue)
+                return # no need to rerun verification that is pending yet
 
-        if obj_dict['type'] == 'transaction':
-            prev_txs = gather_previous_txs(cur, obj_dict)
-            objects.verify_transaction(obj_dict, prev_txs)
-            objects.store_transaction(obj_dict, cur)
-        elif obj_dict['type'] == 'block':
-            new_utxo, height = objects.verify_block(obj_dict)
-            objects.store_block(obj_dict, new_utxo, height, cur)
+            if obj_dict['type'] == 'transaction':
+                prev_txs = gather_previous_txs(cur, obj_dict)
+                objects.verify_transaction(obj_dict, prev_txs)
+                objects.store_transaction(obj_dict, cur)
+                MEMPOOL.add_transaction(obj_dict)  # Add transaction to mempool
+            elif obj_dict['type'] == 'block':
+                new_utxo, height = objects.verify_block(obj_dict)
+                objects.store_block(obj_dict, new_utxo, height, cur)
+                MEMPOOL.remove_transactions(obj_dict['transactions'])  # Remove transactions from mempool
 
-            if height > CHAINTIP_HEIGHT:
-                CHAINTIP_HEIGHT = height
-                CHAINTIP = objid
-        else:
-            raise ErrorInvalidFormat("Got an object of unknown type") # assert: false
-        # if everything worked, commit this
-        con.commit()
+                if height > CHAINTIP_HEIGHT:
+                    CHAINTIP_HEIGHT = height
+                    CHAINTIP = objid
+            else:
+                raise ErrorInvalidFormat("Got an object of unknown type") # assert: false
+            # if everything worked, commit this
+            con.commit()
 
-        print("Added new object '{}'".format(objid))
-        VALIDATOR.new_valid_object(objid)
+            print("Added new object '{}'".format(objid))
+            VALIDATOR.new_valid_object(objid)
 
-        # gossip the new object to all connections
-        await broadcast_msg(mk_ihaveobject_msg(objid))
+            # gossip the new object to all connections
+            await broadcast_msg(mk_ihaveobject_msg(objid))
 
-    except NeedMoreObjects as e:
-        print(f"Need more elements: {e.message}")
-        print("Adding this to the validator as a pending task")
-        VALIDATOR.verification_pending(obj_dict, queue, e.missingobjids)
-        for q in CONNECTIONS.values():
-            for missingobjid in e.missingobjids:
-                print(f"Requesting {missingobjid} from peer")
-                await q.put(mk_getobject_msg(missingobjid))
-        print("Returning")
-        return # and consume exception
-    except NodeException as e: # whatever the reason, just reject this
-        con.rollback()
-        print("Failed to verify object '{}': {}".format(objid, str(e)))
-        raise e # and re-raise this
-    except Exception as e:
-        print(f"An exception occured: {str(e)}")
-        con.rollback()
-        raise e
-    finally:
-        con.close()
+        except NeedMoreObjects as e:
+            print(f"Need more elements: {e.message}")
+            print("Adding this to the validator as a pending task")
+            VALIDATOR.verification_pending(obj_dict, queue, e.missingobjids)
+            for q in CONNECTIONS.values():
+                for missingobjid in e.missingobjids:
+                    print(f"Requesting {missingobjid} from peer")
+                    await q.put(mk_getobject_msg(missingobjid))
+            print("Returning")
+            return # and consume exception
+        except NodeException as e: # whatever the reason, just reject this
+            con.rollback()
+            print("Failed to verify object '{}': {}".format(objid, str(e)))
+            raise e # and re-raise this
+        except Exception as e:
+            print(f"An exception occured: {str(e)}")
+            con.rollback()
+            raise e
+        finally:
+            con.close()
 
 
 # returns the chaintip blockid + height
